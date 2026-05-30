@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cat /Users/sunjun/Documents/tmp/ZipTune-AudiobookPlayer/.claude/settings*.json 2>/dev/null; echo \"===\"; cat ~/.claude/settings.json 2>/dev/null)",
+      "Bash(cp /Users/sunjun/Documents/tmp/ZipTune-AudiobookPlayer/src/index.html /tmp/zt_index.txt)",
+      "Bash(cp /Users/sunjun/Documents/tmp/ZipTune-AudiobookPlayer/src/renderer.js /tmp/zt_renderer.txt)",
+      "Bash(cp /Users/sunjun/Documents/tmp/ZipTune-AudiobookPlayer/src/styles.css /tmp/zt_styles.txt)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(node --check src/renderer.js)",
+      "Bash(node --check /Users/sunjun/Documents/tmp/ZipTune-AudiobookPlayer/src/renderer.js)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(node -e \"require\\('child_process'\\); console.log\\('node works'\\)\")",
+      "Bash(echo \"done exit=$?\")",
+      "Bash(echo \"rc=$?\")",
+      "Bash(screencapture -x -o /tmp/ziptune_full.png)",
+      "Bash(npm start *)",
+      "Bash(echo \"RC=$?\")",
+      "Bash(ps aux *)",
+      "Bash(screencapture -x -o /Users/sunjun/Documents/tmp/zt_screen.png)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(tee /Users/sunjun/Documents/tmp/zt_stat.txt)",
+      "Bash(pkill -9 -f \"ZipTune\")",
+      "Bash(pkill -9 -f \"electron \\\\.\")",
+      "Bash(pkill -f \"npm\")",
+      "Bash(rm -f /private/tmp/claude-501/-Users-sunjun-Documents-tmp-ZipTune-AudiobookPlayer/*/tasks/*.output)",
+      "Bash(sync)",
+      "Bash(echo \"launched pid=$!\")",
+      "Bash(osascript -e 'tell application \"System Events\" to set frontmost of \\(first process whose name contains \"Electron\"\\) to true')",
+      "Bash(echo \"activated rc=$?\")",
+      "Bash(osascript -e 'tell application \"System Events\" to tell \\(first process whose name contains \"Electron\"\\) to get value of attribute \"AXWindowNumber\" of front window')",
+      "Bash(pkill -f \"node_modules/electron/dist\")",
+      "Bash(pkill -f \"electron \\\\.\")"
+    ]
+  }
+}

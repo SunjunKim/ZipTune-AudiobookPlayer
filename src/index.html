@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self' file: blob: data:; img-src 'self' data: blob:; media-src 'self' file: blob: data:; script-src 'self' file:; style-src 'self' 'unsafe-inline';" />
+  <title>ZipTune</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Header / now playing -->
+    <header id="header">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="26" height="26">
+            <path d="M7 18 C7 11, 11 7, 16 7 C21 7, 25 11, 25 18" fill="none" stroke="#FF7A00" stroke-width="2.4" stroke-linecap="round"/>
+            <rect x="5.5" y="17" width="5" height="9" rx="2.2" fill="#FF7A00"/>
+            <rect x="21.5" y="17" width="5" height="9" rx="2.2" fill="#FF7A00"/>
+          </svg>
+        </span>
+        <span class="brand-name">ZipTune</span>
+      </div>
+      <div class="np-art" id="npArt" aria-hidden="true">
+        <svg class="np-art-ph" viewBox="0 0 32 32" width="22" height="22">
+          <path d="M7 18 C7 11, 11 7, 16 7 C21 7, 25 11, 25 18" fill="none" stroke="#FF7A00" stroke-width="2.4" stroke-linecap="round"/>
+          <rect x="5.5" y="17" width="5" height="9" rx="2.2" fill="#FF7A00"/>
+          <rect x="21.5" y="17" width="5" height="9" rx="2.2" fill="#FF7A00"/>
+        </svg>
+        <img id="npArtImg" class="hidden" alt="" />
+      </div>
+      <div class="now-playing">
+        <div class="np-title" id="npTitle">Nothing playing</div>
+        <div class="np-sub" id="npSub">Drop audio files or a .zip to begin</div>
+      </div>
+      <button class="icon-btn" id="compactBtn" title="Compact mode">
+        <svg id="compactIcon" viewBox="0 0 24 24" width="20" height="20"><path d="M9 4H5v4M15 4h4v4M9 20H5v-4M15 20h4v-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <svg id="expandIcon" class="hidden" viewBox="0 0 24 24" width="20" height="20"><path d="M4 9V5h4M20 9V5h-4M4 15v4h4M20 15v4h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </header>
+
+    <!-- Main content: two playlists side by side -->
+    <main id="main">
+      <section class="panel" id="mainPanel">
+        <div class="panel-head">
+          <h2>Playlist</h2>
+          <span class="count" id="mainCount">0 tracks</span>
+        </div>
+        <ul class="track-list" id="mainList"></ul>
+      </section>
+
+      <section class="panel sub-panel hidden" id="subPanel">
+        <div class="panel-head">
+          <h2>📦 <span id="subZipName">Archive</span></h2>
+          <button class="icon-btn small" id="closeSubBtn" title="Close archive">✕</button>
+        </div>
+        <div class="cover hidden" id="subCover">
+          <img id="subCoverImg" alt="Archive cover" />
+        </div>
+        <ul class="track-list" id="subList"></ul>
+      </section>
+    </main>
+
+    <!-- Transport controls -->
+    <footer id="controls">
+      <div class="seek-row">
+        <span class="time" id="curTime">0:00</span>
+        <input type="range" id="seek" class="seek" min="0" max="1000" value="0" step="1" />
+        <span class="time" id="durTime">0:00</span>
+      </div>
+      <div class="buttons-row">
+        <div class="left-tools">
+          <button class="icon-btn" id="sortBtn" title="Sort A→Z (natural numeric order)">
+            <svg viewBox="0 0 24 24" width="20" height="20"><path d="M4 7h10M4 12h7M4 17h4M16 8l3-3 3 3M19 5v14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <button class="icon-btn" id="shuffleBtn" title="Shuffle playlist">
+            <svg viewBox="0 0 24 24" width="20" height="20"><path d="M3 17h4l3-3M3 7h4l10 10h4M17 7h4M14 7h3l4 4M17 21l4-4M17 3l4 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+
+        <div class="center-controls">
+          <button class="icon-btn" id="prevBtn" title="Previous (Media Prev)">
+            <svg viewBox="0 0 24 24" width="24" height="24"><path d="M7 5v14M20 5l-10 7 10 7z" fill="currentColor"/></svg>
+          </button>
+          <button class="icon-btn play" id="playBtn" title="Play / Pause (Media Play/Pause)">
+            <svg id="playIcon" viewBox="0 0 24 24" width="30" height="30"><path d="M7 5l13 7-13 7z" fill="currentColor"/></svg>
+            <svg id="pauseIcon" class="hidden" viewBox="0 0 24 24" width="30" height="30"><path d="M7 5h4v14H7zM13 5h4v14h-4z" fill="currentColor"/></svg>
+          </button>
+          <button class="icon-btn" id="nextBtn" title="Next (Media Next)">
+            <svg viewBox="0 0 24 24" width="24" height="24"><path d="M17 5v14M4 5l10 7-10 7z" fill="currentColor"/></svg>
+          </button>
+          <div class="speed-control" title="Playback speed">
+            <select id="speedSelect" class="speed-select" aria-label="Playback speed">
+              <option value="0.5">0.5×</option>
+              <option value="1" selected>1×</option>
+              <option value="1.5">1.5×</option>
+              <option value="2">2×</option>
+              <option value="2.5">2.5×</option>
+              <option value="3">3×</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="right-tools">
+          <button class="icon-btn" id="muteBtn" title="Mute">
+            <svg id="volIcon" viewBox="0 0 24 24" width="20" height="20"><path d="M4 9v6h4l5 5V4L8 9zM16 8a5 5 0 0 1 0 8M18.5 5.5a9 9 0 0 1 0 13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <input type="range" id="volume" class="volume" min="0" max="100" value="80" />
+        </div>
+      </div>
+    </footer>
+
+    <!-- Drag-and-drop split overlay -->
+    <div id="dropOverlay" class="hidden">
+      <div class="drop-half" id="dropAppend" data-mode="append">
+        <div class="drop-icon">＋</div>
+        <div class="drop-label">Add to end of playlist</div>
+      </div>
+      <div class="drop-half danger" id="dropReplace" data-mode="replace">
+        <div class="drop-icon">↻</div>
+        <div class="drop-label">Clear list &amp; play this</div>
+      </div>
+    </div>
+  </div>
+
+  <audio id="audio"></audio>
+
+  <script src="natural-sort.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

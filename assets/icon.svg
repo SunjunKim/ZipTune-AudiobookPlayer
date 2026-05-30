@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Black rounded background -->
+  <rect x="0" y="0" width="1024" height="1024" rx="220" ry="220" fill="#0a0a0a"/>
+  <rect x="0" y="0" width="1024" height="1024" rx="220" ry="220" fill="url(#bgGlow)"/>
+  <defs>
+    <radialGradient id="bgGlow" cx="50%" cy="38%" r="62%">
+      <stop offset="0%" stop-color="#1a1a1a"/>
+      <stop offset="100%" stop-color="#000000"/>
+    </radialGradient>
+    <linearGradient id="orange" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ff9d2e"/>
+      <stop offset="100%" stop-color="#f47e0a"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Headphone: headband + two ear cups -->
+  <g fill="none" stroke="#FF7A00" stroke-width="64" stroke-linecap="round">
+    <!-- Headband arc -->
+    <path d="M 268 560 C 268 360, 412 250, 512 250 C 612 250, 756 360, 756 560"/>
+  </g>
+
+  <!-- Left ear cup -->
+  <rect x="212" y="540" width="150" height="250" rx="58" ry="58" fill="#FF7A00"/>
+  <rect x="240" y="566" width="94" height="198" rx="40" ry="40" fill="#0a0a0a"/>
+
+  <!-- Right ear cup -->
+  <rect x="662" y="540" width="150" height="250" rx="58" ry="58" fill="#FF7A00"/>
+  <rect x="690" y="566" width="94" height="198" rx="40" ry="40" fill="#0a0a0a"/>
+</svg>
