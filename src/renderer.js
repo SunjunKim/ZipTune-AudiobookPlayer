@@ -54,6 +54,8 @@ const el = {
   brandName: $('brandName'),
   npTitle: $('npTitle'), npSub: $('npSub'),
   npArt: $('npArt'), npArtImg: $('npArtImg'),
+  artViewer: $('artViewer'), artViewerStage: $('artViewerStage'),
+  artViewerImg: $('artViewerImg'), artViewerClose: $('artViewerClose'),
   compactBtn: $('compactBtn'), compactIcon: $('compactIcon'), expandIcon: $('expandIcon'),
   mainList: $('mainList'), mainCount: $('mainCount'),
   subPanel: $('subPanel'), subList: $('subList'), subZipName: $('subZipName'),
@@ -209,6 +211,11 @@ function renderMainList() {
     // in the sub-panel — never disturbs playback. Double click plays.
     li.addEventListener('click', (e) => {
       if (e.target.classList.contains('remove')) { removeItem(i); return; }
+      // Clicking the cover thumbnail itself enlarges it instead of selecting.
+      if (e.target.tagName === 'IMG' && e.target.closest('.art')) {
+        openArtViewer(e.target.currentSrc || e.target.src);
+        return;
+      }
       selectMain(i);
       const it = state.playlist[i];
       if (it && it.kind === 'zip' && !it.missing) browseZip(i);
@@ -818,6 +825,9 @@ function removeItem(i) {
     updateNowPlaying();
   }
   remapZipIndices();
+  // Removing a row should not yank the list to the playing track. Mark the
+  // current index as already-scrolled so the render's scrollActiveIntoView is a no-op.
+  lastScroll.main = state.currentIndex;
   renderMainList();
 }
 
@@ -1507,6 +1517,93 @@ function refreshNowArt() {
     el.npArt.classList.remove('has-art');
   }
 }
+
+// ---------------------------------------------------------------------------
+// Album-cover lightbox: click the header art to view it full-window with
+// zoom (wheel / click) and pan (drag). Image fits the window keeping ratio.
+// ---------------------------------------------------------------------------
+const artZoom = { scale: 1, x: 0, y: 0, dragging: false, moved: false, sx: 0, sy: 0, ox: 0, oy: 0 };
+
+function applyArtZoom() {
+  const z = artZoom;
+  el.artViewerImg.style.transform = `translate(${z.x}px, ${z.y}px) scale(${z.scale})`;
+  el.artViewerImg.classList.toggle('zoomed', z.scale > 1);
+}
+function resetArtZoom() { artZoom.scale = 1; artZoom.x = 0; artZoom.y = 0; applyArtZoom(); }
+
+// Zoom by `factor`, keeping the point under (clientX, clientY) anchored.
+function zoomArtAt(clientX, clientY, factor) {
+  const z = artZoom;
+  const r = el.artViewerStage.getBoundingClientRect();
+  const px = clientX - (r.left + r.width / 2);
+  const py = clientY - (r.top + r.height / 2);
+  const next = Math.min(8, Math.max(1, z.scale * factor));
+  if (next === z.scale) return;
+  z.x = px - ((px - z.x) / z.scale) * next;
+  z.y = py - ((py - z.y) / z.scale) * next;
+  z.scale = next;
+  if (z.scale === 1) { z.x = 0; z.y = 0; }
+  applyArtZoom();
+}
+
+// Open the lightbox for a given image source (any visible album-cover element).
+function openArtViewer(src) {
+  if (!src) return;
+  el.artViewerImg.src = src;
+  resetArtZoom();
+  el.artViewer.classList.remove('hidden');
+}
+function closeArtViewer() {
+  el.artViewer.classList.add('hidden');
+  el.artViewerImg.removeAttribute('src');
+}
+
+// Click any displayed cover to enlarge: the big archive cover, the compact
+// header thumbnail, or a per-track thumbnail.
+el.subCoverImg.addEventListener('click', () => {
+  openArtViewer(el.subCoverImg.currentSrc || el.subCoverImg.src);
+});
+el.npArt.addEventListener('click', () => {
+  if (!el.npArt.classList.contains('has-art')) return;
+  openArtViewer(el.npArtImg.currentSrc || el.npArtImg.src);
+});
+el.artViewerClose.addEventListener('click', closeArtViewer);
+// Click outside the image (backdrop / empty stage) closes.
+el.artViewer.addEventListener('click', (e) => {
+  if (e.target === el.artViewer || e.target === el.artViewerStage) closeArtViewer();
+});
+el.artViewerStage.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  zoomArtAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+}, { passive: false });
+
+// Drag to pan when zoomed in.
+el.artViewerImg.addEventListener('pointerdown', (e) => {
+  if (artZoom.scale <= 1) return;
+  const z = artZoom;
+  z.dragging = true; z.moved = false;
+  z.sx = e.clientX; z.sy = e.clientY; z.ox = z.x; z.oy = z.y;
+  el.artViewerImg.setPointerCapture(e.pointerId);
+  el.artViewerImg.classList.add('dragging');
+});
+el.artViewerImg.addEventListener('pointermove', (e) => {
+  const z = artZoom;
+  if (!z.dragging) return;
+  z.x = z.ox + (e.clientX - z.sx);
+  z.y = z.oy + (e.clientY - z.sy);
+  if (Math.abs(e.clientX - z.sx) > 3 || Math.abs(e.clientY - z.sy) > 3) z.moved = true;
+  applyArtZoom();
+});
+function endArtDrag() { artZoom.dragging = false; el.artViewerImg.classList.remove('dragging'); }
+el.artViewerImg.addEventListener('pointerup', endArtDrag);
+el.artViewerImg.addEventListener('pointercancel', endArtDrag);
+// Click image toggles zoom at the cursor (ignored right after a drag-pan).
+el.artViewerImg.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (artZoom.moved) { artZoom.moved = false; return; }
+  if (artZoom.scale > 1) resetArtZoom();
+  else zoomArtAt(e.clientX, e.clientY, 2.5);
+});
 
 function syncPlayButton() {
   const playing = !audio.paused && !!audio.src;
@@ -2211,6 +2308,11 @@ $('modalOverlay').addEventListener('mousedown', (e) => {
 window.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   closeContextMenu();
+  if (!el.artViewer.classList.contains('hidden')) {
+    e.preventDefault();
+    closeArtViewer();
+    return;
+  }
   if (!$('modalOverlay').classList.contains('hidden')) {
     e.preventDefault();
     if (modalClosable) closeModal();

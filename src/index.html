@@ -137,6 +137,14 @@
   <!-- Right-click context menu (populated dynamically) -->
   <div id="ctxMenu" class="ctx-menu hidden"></div>
 
+  <!-- Album-cover image lightbox (zoom / pan) -->
+  <div id="artViewer" class="hidden">
+    <button class="art-viewer-close" id="artViewerClose" title="Close">✕</button>
+    <div class="art-viewer-stage" id="artViewerStage">
+      <img id="artViewerImg" alt="Album cover" draggable="false" />
+    </div>
+  </div>
+
   <!-- Reusable modal (confirmations) -->
   <div id="modalOverlay" class="hidden">
     <div class="modal" role="dialog" aria-modal="true">
