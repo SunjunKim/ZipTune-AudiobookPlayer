@@ -1,7 +1,7 @@
 {
   "name": "sonobook",
   "productName": "Sonobook Player",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A simple cross-platform audio player that also plays audio from zip archives.",
   "main": "main.js",
   "homepage": "https://github.com/SunjunKim/sonobook",
