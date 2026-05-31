@@ -35,6 +35,17 @@ function configureAppDataPaths() {
 
 const appDataDir = configureAppDataPaths();
 
+// Sandboxed preload scripts cannot require local modules. Hand the static
+// version fields across IPC so the preload can expose them to the renderer.
+ipcMain.on('app-info', (event) => {
+  event.returnValue = {
+    name: versionInfo.name,
+    version: versionInfo.version,
+    title: versionInfo.title,
+    tagName: versionInfo.tagName
+  };
+});
+
 // Audio extensions — kept in sync with the renderer; used by the zip fingerprint
 // so it hashes only the audio chapters (a re-saved cover image won't reset it).
 const FP_AUDIO_EXT = new Set([
