@@ -21,7 +21,7 @@
         <img class="np-art-ph" src="../assets/icon.svg" alt="" />
         <img id="npArtImg" class="hidden" alt="" />
       </div>
-      <div class="now-playing">
+      <div class="now-playing" id="nowPlaying" title="Reveal the playing track in the playlist">
         <div class="np-title" id="npTitle">Nothing playing</div>
         <div class="np-sub" id="npSub">Drop audio files or a .zip to begin</div>
       </div>
@@ -44,6 +44,12 @@
           </div>
         </div>
         <ul class="track-list" id="mainList"></ul>
+        <div class="sel-bar hidden" id="selBar">
+          <button class="list-btn danger" id="removeSelBtn" title="Remove the selected tracks from the playlist">
+            <svg viewBox="0 0 24 24" width="15" height="15"><path d="M5 7h14M9 7V4h6v3M7 7l1 13h8l1-13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>Remove selected</span>
+          </button>
+        </div>
         <div class="list-bar" id="listBar">
           <button class="list-btn" id="saveListBtn" title="Save this playlist to an .m3u file">
             <svg viewBox="0 0 24 24" width="15" height="15"><path d="M5 4h11l3 3v13H5zM8 4v5h7V4M8 20v-6h8v6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>

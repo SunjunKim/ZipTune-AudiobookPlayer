@@ -62,7 +62,7 @@ html, body {
 }
 .np-art img { width: 100%; height: 100%; object-fit: cover; }
 .np-art.has-art .np-art-ph { display: none; }
-.now-playing { overflow: hidden; flex: 1; }
+.now-playing { overflow: hidden; flex: 1; cursor: pointer; }
 #compactBtn { flex: 0 0 auto; margin-left: auto; }
 .np-title {
   font-size: 15px; font-weight: 600;
@@ -136,8 +136,9 @@ html, body {
   border: 1px solid transparent;
 }
 .track:hover { background: #202020; }
-.track.active { background: rgba(255,122,0,.14); border-color: var(--accent-dim); }   /* playing/current */
-.track.selected { background: rgba(110,150,255,.15); border-color: #5572c4; }          /* single-click pick */
+.track.active { background: transparent; border-color: var(--accent); }                 /* playing → orange outline only */
+.track.active.selected { background: rgba(255,122,0,.14); border-color: var(--accent); } /* playing + selected → orange tint */
+.track.selected { background: rgba(110,150,255,.15); border-color: #5572c4; }            /* selected → blue tint */
 .track.dragging { opacity: .4; }
 .track.drop-before { box-shadow: inset 0 2px 0 var(--accent); }
 .track.drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
@@ -242,6 +243,12 @@ html, body {
   background: var(--panel-2);
   border-top: 1px solid var(--border);
 }
+.sel-bar {
+  display: flex;
+  padding: 8px 10px 0;
+  background: var(--panel-2);
+}
+.sel-bar .list-btn { border-color: var(--danger); color: var(--danger); }
 .list-btn {
   flex: 1;
   display: flex;

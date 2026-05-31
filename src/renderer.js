@@ -18,7 +18,8 @@ let uid = 0;
 const state = {
   playlist: [],        // { id, name, kind: 'audio'|'zip', path }
   currentIndex: -1,    // index into playlist of the active (playing/loaded) item
-  selectedId: null,    // id of the single-click-highlighted item (selection only)
+  selectedIds: new Set(), // ids of highlighted items (multi-select; selection only)
+  selectAnchorId: null,   // id of the shift-click range anchor
   // Zip browsing is decoupled from zip playback: the sub-panel shows `view`
   // (the archive you're looking at); `zip` is the archive currently producing
   // audio. They reference the SAME object when you browse the playing zip.
@@ -57,7 +58,9 @@ const el = {
   artViewer: $('artViewer'), artViewerStage: $('artViewerStage'),
   artViewerImg: $('artViewerImg'), artViewerClose: $('artViewerClose'),
   compactBtn: $('compactBtn'), compactIcon: $('compactIcon'), expandIcon: $('expandIcon'),
+  nowPlaying: $('nowPlaying'),
   mainList: $('mainList'), mainCount: $('mainCount'),
+  selBar: $('selBar'), removeSelBtn: $('removeSelBtn'),
   subPanel: $('subPanel'), subList: $('subList'), subZipName: $('subZipName'),
   subCover: $('subCover'), subCoverImg: $('subCoverImg'),
   closeSubBtn: $('closeSubBtn'),
@@ -193,7 +196,7 @@ function renderMainList() {
   state.playlist.forEach((item, i) => {
     const li = document.createElement('li');
     const current = i === state.currentIndex;            // playing / loaded
-    const selected = !current && item.id === state.selectedId; // single-click pick
+    const selected = state.selectedIds.has(item.id);     // multi-select pick
     li.className = 'track' + (current ? ' active' : '') + (selected ? ' selected' : '');
     li.draggable = true;
     li.dataset.index = String(i);
@@ -216,9 +219,7 @@ function renderMainList() {
         openArtViewer(e.target.currentSrc || e.target.src);
         return;
       }
-      selectMain(i);
-      const it = state.playlist[i];
-      if (it && it.kind === 'zip' && !it.missing) browseZip(i);
+      handleSelectClick(i, e);
     });
     li.addEventListener('dblclick', (e) => {
       if (e.target.classList.contains('remove')) return;
@@ -231,6 +232,7 @@ function renderMainList() {
     gateItemWork(item);    // flag dark-red if gone; else thumb + fingerprint
   });
   scrollActiveIntoView(el.mainList, state.currentIndex, 'main');
+  updateSelectionUI();
 }
 
 // Inner HTML for a main-list item's left thumbnail box: artwork if we have it,
@@ -1023,14 +1025,14 @@ function promotePreloadedNext(spec, resume = true) {
     target.z.index = target.chapterIndex;
     target.z.selIndex = target.chapterIndex;
     state.currentIndex = mainIndex;
-    state.selectedId = target.itemId;
+    setSoleSelection(target.itemId);
     if (target.enterZip) setView(target.z);
     else if (state.view === target.z) renderSubList();
     if (!target.z.coverUrl) loadCover(target.z);
   } else {
     state.zip = null;
     state.currentIndex = mainIndex;
-    state.selectedId = target.itemId;
+    setSoleSelection(target.itemId);
     closeView();
   }
 
@@ -1072,7 +1074,7 @@ function playIndex(i, autoplay = true, resume = true) {
     audio.load();
   }
   state.currentIndex = i;
-  state.selectedId = item.id; // selection follows the now-current item
+  setSoleSelection(item.id); // selection follows the now-current item
   if (item.kind !== 'zip') closeView();
   playIntent = autoplay; // selecting without autoplay must not trigger auto-skip
 
@@ -1283,7 +1285,7 @@ async function playChapter(z, i, autoplay = true, resume = true) {
   if (state.zip && state.zip !== z && state.zip !== state.view) releaseZip(state.zip);
   state.zip = z;
   state.currentIndex = z.mainIndex;
-  if (state.playlist[z.mainIndex]) state.selectedId = state.playlist[z.mainIndex].id;
+  if (state.playlist[z.mainIndex]) setSoleSelection(state.playlist[z.mainIndex].id);
   z.index = i;
   z.selIndex = i;
   playIntent = autoplay;
@@ -1567,6 +1569,14 @@ el.npArt.addEventListener('click', () => {
   if (!el.npArt.classList.contains('has-art')) return;
   openArtViewer(el.npArtImg.currentSrc || el.npArtImg.src);
 });
+// Clicking the now-playing label selects the playing track and reveals it.
+el.nowPlaying.addEventListener('click', () => {
+  if (state.currentIndex < 0) return;
+  setSoleSelection(state.playlist[state.currentIndex].id);
+  renderMainList();
+  lastScroll.main = -1;
+  scrollActiveIntoView(el.mainList, state.currentIndex, 'main');
+});
 el.artViewerClose.addEventListener('click', closeArtViewer);
 // Click outside the image (backdrop / empty stage) closes.
 el.artViewer.addEventListener('click', (e) => {
@@ -1710,14 +1720,20 @@ let dragFromIndex = -1;
 function attachReorderHandlers(li) {
   li.addEventListener('dragstart', (e) => {
     dragFromIndex = Number(li.dataset.index);
-    li.classList.add('dragging');
+    // Dragging a row inside a multi-selection moves the whole block; dragging an
+    // unselected row moves just it (selection left untouched).
+    if (isMultiDrag(dragFromIndex)) {
+      el.mainList.querySelectorAll('.track.selected').forEach((n) => n.classList.add('dragging'));
+    } else {
+      li.classList.add('dragging');
+    }
     e.dataTransfer.effectAllowed = 'move';
     // Mark as an internal reorder so the file-drop overlay stays hidden.
     e.dataTransfer.setData('application/x-sonobook-player-reorder', '1');
   });
   li.addEventListener('dragend', () => {
     dragFromIndex = -1;
-    li.classList.remove('dragging');
+    el.mainList.querySelectorAll('.dragging').forEach((n) => n.classList.remove('dragging'));
     clearDropMarkers();
   });
   li.addEventListener('dragover', (e) => {
@@ -1734,9 +1750,16 @@ function attachReorderHandlers(li) {
     e.stopPropagation();
     let to = Number(li.dataset.index);
     const before = isBeforeHalf(e, li);
-    reorder(dragFromIndex, to, before);
+    if (isMultiDrag(dragFromIndex)) reorderMulti(selectedIndices(), to, before);
+    else reorder(dragFromIndex, to, before);
     clearDropMarkers();
   });
+}
+
+// True when the dragged row is part of an active multi-selection.
+function isMultiDrag(from) {
+  const it = state.playlist[from];
+  return !!it && state.selectedIds.size > 1 && state.selectedIds.has(it.id);
 }
 
 function isBeforeHalf(e, li) {
@@ -1758,6 +1781,23 @@ function reorder(from, to, before) {
   else insertAt = before ? to : to + 1;
   insertAt = Math.max(0, Math.min(state.playlist.length, insertAt));
   state.playlist.splice(insertAt, 0, moved);
+  restoreCurrentById(id);
+  remapZipIndices();
+  renderMainList();
+}
+
+// Move a block of selected rows (fromIndices) to the drop target as one unit,
+// preserving their relative order. Dropping inside the block is a no-op.
+function reorderMulti(fromIndices, to, before) {
+  const movingSet = new Set(fromIndices.map((idx) => state.playlist[idx]));
+  const target = state.playlist[to];
+  if (!movingSet.size || movingSet.has(target)) return;
+  const id = rememberCurrentId();
+  const moving = state.playlist.filter((it) => movingSet.has(it));   // playlist order
+  const remaining = state.playlist.filter((it) => !movingSet.has(it));
+  const idx = remaining.indexOf(target);
+  remaining.splice(before ? idx : idx + 1, 0, ...moving);
+  state.playlist = remaining;
   restoreCurrentById(id);
   remapZipIndices();
   renderMainList();
@@ -2227,11 +2267,103 @@ function showContextMenu(x, y, items) {
 function closeContextMenu() { $('ctxMenu').classList.add('hidden'); }
 
 // Single-click selection (highlight only; never touches playback).
+// Indices of every currently-selected playlist item, ascending.
+const selectedIndices = () =>
+  state.playlist.reduce((acc, it, k) => (state.selectedIds.has(it.id) && acc.push(k), acc), []);
+
+// Collapse selection to a single item (used by playback-follow + plain click).
+function setSoleSelection(id) {
+  state.selectedIds = new Set(id == null ? [] : [id]);
+  state.selectAnchorId = id;
+}
+
+// Click with modifier conventions:
+//   plain        → sole selection (and browse a zip)
+//   ctrl/cmd     → toggle this item in/out of the selection
+//   shift        → select the range from the anchor to this item
+function handleSelectClick(i, e) {
+  const item = state.playlist[i];
+  if (!item) return;
+  const ctrl = e.ctrlKey || e.metaKey;
+
+  if (e.shiftKey && state.selectAnchorId != null) {
+    const anchor = state.playlist.findIndex((it) => it.id === state.selectAnchorId);
+    if (anchor >= 0) {
+      const lo = Math.min(anchor, i), hi = Math.max(anchor, i);
+      state.selectedIds = new Set();
+      for (let k = lo; k <= hi; k++) state.selectedIds.add(state.playlist[k].id);
+      renderMainList();
+      return;
+    }
+  }
+
+  if (ctrl) {
+    if (state.selectedIds.has(item.id)) state.selectedIds.delete(item.id);
+    else state.selectedIds.add(item.id);
+    state.selectAnchorId = item.id;
+    renderMainList();
+    return;
+  }
+
+  selectMain(i);
+}
+
 function selectMain(i) {
   const item = state.playlist[i];
   if (!item) return;
-  state.selectedId = item.id;
+  setSoleSelection(item.id);
   if (item.kind !== 'zip') closeView();
+  renderMainList();
+  if (item.kind === 'zip' && !item.missing) browseZip(i);
+}
+
+// Toggle the "Remove selected (n)" bar; only shown for a multi-selection.
+function updateSelectionUI() {
+  const present = new Set(state.playlist.map((it) => it.id));
+  for (const id of [...state.selectedIds]) if (!present.has(id)) state.selectedIds.delete(id);
+  const n = state.selectedIds.size;
+  if (el.selBar) el.selBar.classList.toggle('hidden', n < 2);
+  if (el.removeSelBtn) {
+    const span = el.removeSelBtn.querySelector('span');
+    if (span) span.textContent = `Remove selected (${n})`;
+  }
+}
+
+// Remove every selected item at once, keeping the playing track if it survives.
+function removeSelected() {
+  if (!state.selectedIds.size) return;
+  const ids = new Set(state.selectedIds);
+  const curId = rememberCurrentId();
+  const removingCurrent = curId != null && ids.has(curId);
+  const gone = state.playlist.filter((it) => ids.has(it.id));
+  if (state.zip && gone.some((it) => it.id === state.zip.id)) stopZipPlayback(false);
+  if (state.view && gone.some((it) => it.id === state.view.id)) closeView();
+  revokeThumbs(gone);
+  state.playlist = state.playlist.filter((it) => !ids.has(it.id));
+  if (removingCurrent) {
+    state.currentIndex = -1;
+    audio.removeAttribute('src');
+    audio.load();
+    updateNowPlaying();
+  } else {
+    state.currentIndex = curId != null ? state.playlist.findIndex((it) => it.id === curId) : -1;
+  }
+  state.selectedIds = new Set();
+  state.selectAnchorId = null;
+  remapZipIndices();
+  lastScroll.main = state.currentIndex;
+  renderMainList();
+}
+
+// Move the whole selection block to the top or bottom of the playlist.
+function moveSelectedTo(edge) {
+  const moving = state.playlist.filter((it) => state.selectedIds.has(it.id));
+  if (!moving.length) return;
+  const id = rememberCurrentId();
+  const rest = state.playlist.filter((it) => !state.selectedIds.has(it.id));
+  state.playlist = edge === 'top' ? [...moving, ...rest] : [...rest, ...moving];
+  restoreCurrentById(id);
+  remapZipIndices();
   renderMainList();
 }
 function selectSub(i) {
@@ -2244,6 +2376,19 @@ function selectSub(i) {
 function openEntryMenu(e, i) {
   const item = state.playlist[i];
   if (!item) return;
+
+  // Right-clicking inside a multi-selection → bulk actions for the whole set.
+  if (state.selectedIds.size > 1 && state.selectedIds.has(item.id)) {
+    const n = state.selectedIds.size;
+    showContextMenu(e.clientX, e.clientY, [
+      { label: 'Move selected to top', onClick: () => moveSelectedTo('top') },
+      { label: 'Move selected to bottom', onClick: () => moveSelectedTo('bottom') },
+      { separator: true },
+      { label: `Remove selected (${n})`, danger: true, onClick: removeSelected }
+    ]);
+    return;
+  }
+
   const hasProgress = !!(item.fingerprint && progressDB.items[item.fingerprint]);
   const last = state.playlist.length - 1;
   const items = [
@@ -2291,6 +2436,7 @@ function showGlobalMenu(rect) {
 // ---------------------------------------------------------------------------
 // Wiring: buttons, audio events, media keys
 // ---------------------------------------------------------------------------
+if (el.removeSelBtn) el.removeSelBtn.addEventListener('click', removeSelected);
 $('saveListBtn').addEventListener('click', exportPlaylistFlow);
 $('loadListBtn').addEventListener('click', importPlaylistFlow);
 $('clearListBtn').addEventListener('click', onClearClick);

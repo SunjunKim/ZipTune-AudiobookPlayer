@@ -1,7 +1,7 @@
 'use strict';
 
 const name = 'Sonobook Player';
-const version = '0.2';
+const version = '0.3';
 
 function toPackageVersion(value) {
   const parts = String(value).split('.');
