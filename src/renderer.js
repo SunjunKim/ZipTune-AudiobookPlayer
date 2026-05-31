@@ -180,9 +180,20 @@ function renderMainList() {
       '<span class="remove" title="Remove">✕</span>' +
       '<span class="track-progress"><span class="track-progress-fill"></span></span>';
 
+    // Single click selects (audio: load, no play; zip: open its chapter list).
+    // Double click actually plays (zip: resumes at the saved chapter/position).
     li.addEventListener('click', (e) => {
       if (e.target.classList.contains('remove')) { removeItem(i); return; }
-      playIndex(i);
+      const it = state.playlist[i];
+      if (it && it.kind === 'zip') {
+        if (!it.missing && !(state.zip && state.zip.mainIndex === i)) expandZip(i);
+      } else if (i !== state.currentIndex) {
+        playIndex(i, false);
+      }
+    });
+    li.addEventListener('dblclick', (e) => {
+      if (e.target.classList.contains('remove')) return;
+      playIndex(i, true);
     });
 
     attachReorderHandlers(li);
@@ -417,6 +428,11 @@ function zipAggregateFraction(item, rec) {
     listened += Math.min(t ? t[0] : 0, est);
   });
   return total > 0 ? clamp01(listened / total) : 0;
+}
+
+// Whole zip listened to the end (used to restart it from chapter 0).
+function isZipComplete(item, rec) {
+  return zipAggregateFraction(item, rec) >= 0.99;
 }
 
 // Fraction for a single zip chapter (measured duration, else size-estimated).
@@ -742,7 +758,9 @@ function renderSubList() {
       `<span class="name">${escapeHtml(entry.name)}</span>` +
       '<span class="track-time"></span>' +
       '<span class="track-progress"><span class="track-progress-fill"></span></span>';
-    li.addEventListener('click', () => playSub(i));
+    // Single click selects the chapter; double click plays it.
+    li.addEventListener('click', () => { if (!state.zip || i !== state.zip.index) playSub(i, false); });
+    li.addEventListener('dblclick', () => playSub(i, true));
     el.subList.appendChild(li);
     applySubUnderline(li, i);
   });
@@ -832,7 +850,7 @@ function stopPlayback() {
 // ---------------------------------------------------------------------------
 // Playback — zip archives (secondary playlist, requirement 5)
 // ---------------------------------------------------------------------------
-async function openZip(item, mainIndex) {
+async function openZip(item, mainIndex, autoplay = true) {
   let list;
   try {
     // Only the directory is read here — no archive-wide decompression.
@@ -873,8 +891,12 @@ async function openZip(item, mainIndex) {
   applyUnderline(item);
   refreshSubUnderlines();
   const rec = item.fingerprint && progressDB.items[item.fingerprint];
-  if (rec && rec.i) startIndex = Math.max(0, Math.min(rec.i, entries.length - 1));
-  playSub(startIndex);
+  // Resume at the last-played chapter — unless the book is finished, in which
+  // case playing it restarts from the first chapter.
+  if (rec && rec.i && !isZipComplete(item, rec)) {
+    startIndex = Math.max(0, Math.min(rec.i, entries.length - 1));
+  }
+  playSub(startIndex, autoplay);
 }
 
 // Prefer common artwork names (cover/folder/front/album/art), otherwise the
@@ -903,11 +925,11 @@ async function loadCover(internalPath) {
   }
 }
 
-async function playSub(i) {
+async function playSub(i, autoplay = true) {
   if (!state.zip || i < 0 || i >= state.zip.entries.length) return;
   forceSaveCurrent(false); // persist the outgoing chapter's position
   pendingSeek = null;
-  playIntent = true; // opening/advancing a chapter means we intend to play
+  playIntent = autoplay; // expand (no autoplay) must not arm auto-skip
   state.zip.index = i;
   const entry = state.zip.entries[i];
   const zipPath = state.zip.path;
@@ -931,7 +953,7 @@ async function playSub(i) {
   if (!state.zip || state.zip.path !== zipPath || state.zip.index !== i) return;
   audio.src = entry.blobUrl;
   if (zipItem) primeSubResume(zipItem, i, zipPath); // auto-resume within chapter
-  audio.play().catch(() => {});
+  if (autoplay) audio.play().catch(() => {});
   updateNowPlaying();
   renderSubList();
   renderMainList();
@@ -1442,22 +1464,328 @@ function applyImported(paths, mode) {
 }
 
 // ---------------------------------------------------------------------------
+// Progress reset / mark-finished (right-click actions)
+// ---------------------------------------------------------------------------
+const isCurrent = (item) => state.zip
+  ? state.playlist[state.zip.mainIndex] === item
+  : (state.currentIndex >= 0 && state.playlist[state.currentIndex] === item);
+
+function commitRec(item, upd) {
+  const fp = item.fingerprint;
+  if (!fp) return;
+  localMergeProgress(fp, upd);
+  window.api.saveProgress(fp, upd);
+  applyUnderline(item);
+  if (state.zip && state.playlist[state.zip.mainIndex] === item) refreshSubUnderlines();
+}
+
+// Reset one entry's listened position (keeps the cached running time).
+function resetItemProgress(item) {
+  const rec = item.fingerprint && progressDB.items[item.fingerprint];
+  if (!rec) return;
+  let upd;
+  if (item.kind === 'zip' && rec.e) {
+    const e = {};
+    for (const k of Object.keys(rec.e)) e[k] = [0, rec.e[k][1]]; // keep durations
+    upd = { e, i: 0 };
+  } else {
+    upd = { p: 0 };
+  }
+  commitRec(item, upd);
+  if (isCurrent(item)) {
+    // Restart the currently-playing item: a zip jumps back to its first chapter.
+    if (item.kind === 'zip' && state.zip) playSub(0, !audio.paused);
+    else audio.currentTime = 0;
+  }
+}
+
+// Mark one entry as fully listened (fills bar/segments green).
+function markFinished(item) {
+  const rec = (item.fingerprint && progressDB.items[item.fingerprint]) || null;
+  if (item.kind === 'zip') {
+    if (!item.zipEntries) return;
+    const bps = zipBytesPerSec(item, rec);
+    const e = {};
+    item.zipEntries.forEach((en, k) => {
+      const t = rec && rec.e && rec.e[k];
+      const dur = (t && t[1] > 0) ? t[1]
+        : (bps > 0 && en.uncompressedSize > 0 ? Math.round(en.uncompressedSize * bps) : 0);
+      if (dur > 0) e[k] = [dur, dur];
+    });
+    if (Object.keys(e).length) commitRec(item, { e, i: item.zipEntries.length - 1 });
+  } else if (rec && rec.d > 0) {
+    commitRec(item, { p: rec.d });
+  }
+}
+
+function resetChapterProgress(idx) {
+  if (!state.zip) return;
+  const item = state.playlist[state.zip.mainIndex];
+  const rec = item && item.fingerprint && progressDB.items[item.fingerprint];
+  if (!rec) return;
+  const cur = rec.e && rec.e[idx];
+  const dur = (cur && cur[1] > 0) ? cur[1] : null;
+  commitRec(item, { e: { [idx]: [0, dur] } });
+  if (state.zip.index === idx) audio.currentTime = 0;
+}
+
+function markChapterFinished(idx) {
+  if (!state.zip) return;
+  const item = state.playlist[state.zip.mainIndex];
+  const rec = (item && item.fingerprint && progressDB.items[item.fingerprint]) || null;
+  const en = item.zipEntries && item.zipEntries[idx];
+  if (!en) return;
+  const cur = rec && rec.e && rec.e[idx];
+  const bps = zipBytesPerSec(item, rec);
+  const dur = (cur && cur[1] > 0) ? cur[1]
+    : (bps > 0 && en.uncompressedSize > 0 ? Math.round(en.uncompressedSize * bps) : 0);
+  if (dur > 0) commitRec(item, { e: { [idx]: [dur, dur] } });
+}
+
+// Global wipe of all listened positions — double-confirmed.
+function resetAllProgress() {
+  openModal(
+    'Reset all progress?',
+    '<div class="modal-empty">Clears the listened position of <b>every</b> file. Running times are kept. This cannot be undone.</div>',
+    [
+      { label: 'Cancel', onClick: closeModal },
+      { label: 'Reset all', danger: true, onClick: (e) => {
+        const btn = e.currentTarget;
+        if (btn.dataset.armed !== '1') { // require a confirming second click
+          btn.dataset.armed = '1';
+          btn.textContent = 'Click again to confirm';
+          return;
+        }
+        closeModal();
+        doResetAllProgress();
+      } }
+    ]
+  );
+}
+
+async function doResetAllProgress() {
+  let db = null;
+  try { db = await window.api.resetAllProgress(); } catch (_) {}
+  if (db && db.items) progressDB = db;
+  refreshAllUnderlines();
+  if (state.zip) refreshSubUnderlines();
+}
+
+// Remove every entry whose file no longer exists (bulk cleanup).
+function removeMissingEntries() {
+  const n = state.playlist.filter((it) => it.missing).length;
+  if (!n) return;
+  openModal(
+    'Remove missing entries?',
+    `<div class="modal-empty">Remove ${n} entr${n === 1 ? 'y' : 'ies'} whose file no longer exists?</div>`,
+    [
+      { label: 'Cancel', onClick: closeModal },
+      { label: 'Remove', danger: true, onClick: () => { closeModal(); doRemoveMissing(); } }
+    ]
+  );
+}
+
+function doRemoveMissing() {
+  const cur = state.currentIndex >= 0 ? state.playlist[state.currentIndex] : null;
+  const removingCurrent = !!(cur && cur.missing);
+  const curId = cur && !removingCurrent ? cur.id : null;
+  revokeThumbs(state.playlist.filter((it) => it.missing));
+  state.playlist = state.playlist.filter((it) => !it.missing);
+  if (removingCurrent) {
+    exitZip(false);
+    state.currentIndex = -1;
+    audio.removeAttribute('src');
+    audio.load();
+    updateNowPlaying();
+  } else {
+    state.currentIndex = curId != null ? state.playlist.findIndex((it) => it.id === curId) : -1;
+    if (state.zip) state.zip.mainIndex = state.currentIndex;
+  }
+  renderMainList();
+}
+
+// ---------------------------------------------------------------------------
+// Per-entry reorder / queue / probe helpers (right-click actions)
+// ---------------------------------------------------------------------------
+function moveItem(from, toFinal) {
+  if (from < 0 || from >= state.playlist.length) return;
+  const id = rememberCurrentId();
+  const [m] = state.playlist.splice(from, 1);
+  const t = Math.max(0, Math.min(state.playlist.length, toFinal));
+  state.playlist.splice(t, 0, m);
+  restoreCurrentById(id);
+  if (state.zip) state.zip.mainIndex = state.currentIndex;
+  renderMainList();
+}
+const moveToTop = (i) => moveItem(i, 0);
+const moveToBottom = (i) => moveItem(i, state.playlist.length);
+
+// Move an entry to play right after the current track.
+function playNext(i) {
+  if (i < 0 || i >= state.playlist.length || i === state.currentIndex) return;
+  if (state.currentIndex < 0) { moveItem(i, 0); return; }
+  const curId = state.playlist[state.currentIndex].id;
+  const [m] = state.playlist.splice(i, 1);
+  const curIdx = state.playlist.findIndex((it) => it.id === curId);
+  state.playlist.splice(curIdx + 1, 0, m);
+  state.currentIndex = curIdx;
+  if (state.zip) state.zip.mainIndex = curIdx;
+  renderMainList();
+}
+
+// Force a fresh duration probe for one entry (e.g. after a file downloads).
+async function rescanDuration(item) {
+  const fp = await ensureFingerprint(item).catch(() => null);
+  if (!fp) return;
+  if (item.kind === 'zip') {
+    if (!item.zipEntries || !item.zipEntries.length) return;
+    const dur = await window.api.zipFirstDuration(item.path, item.zipEntries[0].internalPath);
+    if (!dur) return;
+    const cur = (progressDB.items[fp] || {}).e || {};
+    const pos0 = cur['0'] ? cur['0'][0] : 0;
+    commitRec(item, { e: { 0: [pos0, Math.round(dur)] } });
+  } else {
+    const dur = await window.api.getDuration(item.path);
+    if (dur) commitRec(item, { d: Math.round(dur) });
+  }
+}
+
+// Open a zip's chapter list without starting playback.
+function expandZip(i) {
+  const item = state.playlist[i];
+  if (!item || item.kind !== 'zip' || item.missing) return;
+  forceSaveCurrent(false);
+  pendingSeek = null;
+  exitZip(false);
+  state.currentIndex = i;
+  playIntent = false;
+  openZip(item, i, false);
+  updateNowPlaying();
+  renderMainList();
+}
+
+// ---------------------------------------------------------------------------
+// Context menu
+// ---------------------------------------------------------------------------
+function showContextMenu(x, y, items) {
+  const menu = $('ctxMenu');
+  menu.innerHTML = '';
+  items.forEach((it) => {
+    if (it.separator) {
+      const s = document.createElement('div');
+      s.className = 'ctx-sep';
+      menu.appendChild(s);
+      return;
+    }
+    const d = document.createElement('div');
+    d.className = 'ctx-item' + (it.danger ? ' danger' : '') + (it.disabled ? ' disabled' : '');
+    d.textContent = it.label;
+    if (!it.disabled) d.addEventListener('click', () => { closeContextMenu(); it.onClick(); });
+    menu.appendChild(d);
+  });
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+  menu.classList.remove('hidden');
+  // Clamp inside the viewport.
+  const r = menu.getBoundingClientRect();
+  if (r.right > window.innerWidth) menu.style.left = Math.max(4, window.innerWidth - r.width - 6) + 'px';
+  if (r.bottom > window.innerHeight) menu.style.top = Math.max(4, window.innerHeight - r.height - 6) + 'px';
+}
+
+function closeContextMenu() { $('ctxMenu').classList.add('hidden'); }
+
+// Right-click menu for a main entry — item-specific actions only.
+function openEntryMenu(e, i) {
+  const item = state.playlist[i];
+  if (!item) return;
+  const hasProgress = !!(item.fingerprint && progressDB.items[item.fingerprint]);
+  const last = state.playlist.length - 1;
+  const items = [
+    { label: 'Play', onClick: () => playIndex(i) },
+    { label: 'Play next', disabled: state.currentIndex < 0 || i === state.currentIndex, onClick: () => playNext(i) }
+  ];
+  if (item.kind === 'zip') items.push({ label: 'Open (show chapters)', disabled: item.missing, onClick: () => expandZip(i) });
+  items.push(
+    { separator: true },
+    { label: 'Reset progress', disabled: !hasProgress, onClick: () => resetItemProgress(item) },
+    { label: 'Mark as finished', onClick: () => markFinished(item) },
+    { label: 'Re-scan duration', onClick: () => rescanDuration(item) },
+    { separator: true },
+    { label: 'Move to top', disabled: i === 0, onClick: () => moveToTop(i) },
+    { label: 'Move to bottom', disabled: i === last, onClick: () => moveToBottom(i) },
+    { separator: true },
+    { label: 'Reveal in file manager', onClick: () => window.api.revealFile(item.path) },
+    { label: 'Copy file path', onClick: () => window.api.copyText(item.path) },
+    { label: 'Copy file name', onClick: () => window.api.copyText(item.name) },
+    { separator: true },
+    { label: 'Remove from playlist', onClick: () => removeItem(i) }
+  );
+  showContextMenu(e.clientX, e.clientY, items);
+}
+
+// Right-click menu for a zip chapter — item-specific actions only.
+function openSubMenu(e, idx) {
+  showContextMenu(e.clientX, e.clientY, [
+    { label: 'Play', onClick: () => playSub(idx) },
+    { separator: true },
+    { label: 'Reset progress', onClick: () => resetChapterProgress(idx) },
+    { label: 'Mark as finished', onClick: () => markChapterFinished(idx) }
+  ]);
+}
+
+// Global/bulk actions, anchored under the playlist header's "⋮" button.
+function showGlobalMenu(rect) {
+  const n = state.playlist.filter((it) => it.missing).length;
+  showContextMenu(rect.left, rect.bottom + 4, [
+    { label: 'Reset all progress…', danger: true, onClick: resetAllProgress },
+    { label: n ? `Remove missing entries (${n})` : 'Remove missing entries', disabled: !n, onClick: removeMissingEntries }
+  ]);
+}
+
+// ---------------------------------------------------------------------------
 // Wiring: buttons, audio events, media keys
 // ---------------------------------------------------------------------------
 $('saveListBtn').addEventListener('click', exportPlaylistFlow);
 $('loadListBtn').addEventListener('click', importPlaylistFlow);
 $('clearListBtn').addEventListener('click', onClearClick);
 
+// Playlist-header "⋮" → global/bulk actions menu.
+$('listMenuBtn').addEventListener('click', (e) => {
+  e.stopPropagation(); // don't let the window-click handler immediately close it
+  showGlobalMenu(e.currentTarget.getBoundingClientRect());
+});
+
 // Backdrop click / Esc closes the modal.
 $('modalOverlay').addEventListener('mousedown', (e) => {
   if (e.target === $('modalOverlay')) closeModal();
 });
 window.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !$('modalOverlay').classList.contains('hidden')) {
-    e.preventDefault();
-    closeModal();
-  }
+  if (e.key !== 'Escape') return;
+  closeContextMenu();
+  if (!$('modalOverlay').classList.contains('hidden')) { e.preventDefault(); closeModal(); }
 }, true);
+
+// Right-click context menus on the playlists.
+el.mainList.addEventListener('contextmenu', (e) => {
+  const li = e.target.closest('.track[data-index]');
+  if (!li) return;
+  e.preventDefault();
+  openEntryMenu(e, Number(li.dataset.index));
+});
+el.subList.addEventListener('contextmenu', (e) => {
+  if (!state.zip) return;
+  const li = e.target.closest('.track');
+  if (!li) return;
+  e.preventDefault();
+  const idx = Array.prototype.indexOf.call(el.subList.children, li);
+  if (idx >= 0) openSubMenu(e, idx);
+});
+// Dismiss the menu on any outside interaction.
+window.addEventListener('click', closeContextMenu);
+window.addEventListener('blur', closeContextMenu);
+window.addEventListener('resize', closeContextMenu);
+window.addEventListener('contextmenu', (e) => { if (!e.target.closest('.track')) closeContextMenu(); });
+document.addEventListener('scroll', closeContextMenu, true);
 
 el.playBtn.addEventListener('click', togglePlay);
 el.prevBtn.addEventListener('click', prev);

@@ -99,6 +99,7 @@ html, body {
 }
 .panel-head h2 { font-size: 13px; margin: 0; font-weight: 600; letter-spacing: .4px; }
 .count { font-size: 11px; color: var(--muted); }
+.head-right { display: flex; align-items: center; gap: 6px; }
 
 .cover {
   padding: 12px 12px 4px;
@@ -320,6 +321,31 @@ html, body {
 .modal-btn.danger { background: var(--danger); color: #fff; border-color: var(--danger); }
 .modal-btn.danger:hover { background: #ef5350; }
 .modal-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 12px 0; line-height: 1.5; }
+
+/* ---------- Right-click context menu ---------- */
+.ctx-menu {
+  position: fixed;
+  z-index: 200;
+  min-width: 190px;
+  padding: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.6);
+  font-size: 12px;
+}
+.ctx-item {
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  color: var(--text);
+}
+.ctx-item:hover { background: #2b2b2b; color: var(--accent); }
+.ctx-item.danger { color: var(--danger); }
+.ctx-item.danger:hover { background: rgba(224,58,58,.15); color: var(--danger); }
+.ctx-item.disabled { color: var(--muted); pointer-events: none; opacity: .6; }
+.ctx-sep { height: 1px; background: var(--border); margin: 4px 6px; }
 
 /* ---------- Controls ---------- */
 #controls {

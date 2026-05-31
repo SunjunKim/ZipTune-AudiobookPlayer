@@ -133,4 +133,21 @@ function flush() {
   writeNow();
 }
 
-module.exports = { load, getAll, put, flush };
+// Zero the listened position of every record, keeping cached durations.
+function resetAllPositions() {
+  for (const fp of Object.keys(data.items)) {
+    const it = data.items[fp];
+    if (typeof it.p === 'number') it.p = 0;
+    if (typeof it.i === 'number') it.i = 0;
+    if (it.e) {
+      for (const k of Object.keys(it.e)) {
+        if (Array.isArray(it.e[k])) it.e[k][0] = 0;
+      }
+    }
+    it.u = nowSec();
+  }
+  dirty = true;
+  schedule();
+}
+
+module.exports = { load, getAll, put, flush, resetAllPositions };

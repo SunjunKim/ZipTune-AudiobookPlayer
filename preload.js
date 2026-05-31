@@ -43,6 +43,9 @@ contextBridge.exposeInMainWorld('api', {
   fingerprintZip: (p) => ipcRenderer.invoke('fingerprint-zip', p),
   loadProgress: () => ipcRenderer.invoke('progress-load'),
   saveProgress: (fp, rec) => ipcRenderer.invoke('progress-save', fp, rec),
+  resetAllProgress: () => ipcRenderer.invoke('progress-reset-all'),
+  revealFile: (p) => ipcRenderer.invoke('reveal-file', p),
+  copyText: (t) => ipcRenderer.invoke('copy-text', t),
 
   // Lazy running-time probes (no playback): audio via metadata, zip via one entry.
   getDuration: (p) => ipcRenderer.invoke('get-duration', p),

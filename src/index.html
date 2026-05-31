@@ -44,7 +44,12 @@
       <section class="panel" id="mainPanel">
         <div class="panel-head">
           <h2>Playlist</h2>
-          <span class="count" id="mainCount">0 tracks</span>
+          <div class="head-right">
+            <span class="count" id="mainCount">0 tracks</span>
+            <button class="icon-btn small" id="listMenuBtn" title="Playlist actions">
+              <svg viewBox="0 0 24 24" width="16" height="16"><circle cx="12" cy="5" r="1.7" fill="currentColor"/><circle cx="12" cy="12" r="1.7" fill="currentColor"/><circle cx="12" cy="19" r="1.7" fill="currentColor"/></svg>
+            </button>
+          </div>
         </div>
         <ul class="track-list" id="mainList"></ul>
         <div class="list-bar" id="listBar">
@@ -137,7 +142,10 @@
     </div>
   </div>
 
-  <!-- Reusable modal (save name / load picker) -->
+  <!-- Right-click context menu (populated dynamically) -->
+  <div id="ctxMenu" class="ctx-menu hidden"></div>
+
+  <!-- Reusable modal (confirmations) -->
   <div id="modalOverlay" class="hidden">
     <div class="modal" role="dialog" aria-modal="true">
       <div class="modal-title" id="modalTitle"></div>

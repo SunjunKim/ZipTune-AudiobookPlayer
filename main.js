@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, globalShortcut, nativeImage, ipcMain, systemPreferences, dialog, shell } = require('electron');
+const { app, BrowserWindow, globalShortcut, nativeImage, ipcMain, systemPreferences, dialog, shell, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -242,6 +242,12 @@ ipcMain.handle('fingerprint-zip', async (_evt, filePath) => {
 // --- IPC: progress database ---
 ipcMain.handle('progress-load', () => db.getAll());
 ipcMain.handle('progress-save', (_evt, fp, rec) => { db.put(fp, rec); });
+// Zero every file's listened position (running times kept); returns updated map.
+ipcMain.handle('progress-reset-all', () => { db.resetAllPositions(); return db.getAll(); });
+
+// --- IPC: small OS integrations for the context menu ---
+ipcMain.handle('reveal-file', (_evt, filePath) => { shell.showItemInFolder(filePath); });
+ipcMain.handle('copy-text', (_evt, text) => { clipboard.writeText(String(text || '')); });
 
 // --- IPC: playlist session (auto-saved current list) ---
 ipcMain.handle('playlist-load-session', () => playlists.getSession());
