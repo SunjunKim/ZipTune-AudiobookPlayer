@@ -17,7 +17,7 @@
     "dist": "npm run sync-version && npm run icons && electron-builder",
     "dist:mac": "npm run sync-version && npm run icons && electron-builder --mac",
     "dist:win": "npm run sync-version && npm run icons && electron-builder --win",
-    "dist:linux": "npm run sync-version && npm run icons && electron-builder --linux",
+    "dist:linux": "npm run sync-version && npm run icons && PATH=\"/usr/local/opt/binutils/bin:/usr/local/opt/dpkg/bin:/usr/local/opt/fakeroot/bin:$PATH\" electron-builder --linux",
     "tag": "node tools/github-tag.js",
     "github:tag": "npm run sync-version && node tools/github-tag.js --push"
   },
