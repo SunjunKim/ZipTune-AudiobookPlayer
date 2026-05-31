@@ -29,6 +29,7 @@ contextBridge.exposeInMainWorld('api', {
   pathToFileURL: (p) => toFileURL(p),
 
   statFile: (p) => ipcRenderer.invoke('stat-file', p),
+  pathExists: (p) => ipcRenderer.invoke('path-exists', p),
   listDir: (p) => ipcRenderer.invoke('list-dir', p),
   getArtwork: (p) => ipcRenderer.invoke('get-artwork', p),
 
@@ -36,6 +37,22 @@ contextBridge.exposeInMainWorld('api', {
   // that one file. Returns ArrayBuffers.
   listZip: (p) => ipcRenderer.invoke('zip-list', p),
   readZipEntry: (p, internalPath) => ipcRenderer.invoke('zip-entry', p, internalPath),
+
+  // Content fingerprints (never read the whole file) + progress database.
+  fingerprintFile: (p) => ipcRenderer.invoke('fingerprint-file', p),
+  fingerprintZip: (p) => ipcRenderer.invoke('fingerprint-zip', p),
+  loadProgress: () => ipcRenderer.invoke('progress-load'),
+  saveProgress: (fp, rec) => ipcRenderer.invoke('progress-save', fp, rec),
+
+  // Lazy running-time probes (no playback): audio via metadata, zip via one entry.
+  getDuration: (p) => ipcRenderer.invoke('get-duration', p),
+  zipFirstDuration: (p, internalPath) => ipcRenderer.invoke('zip-first-duration', p, internalPath),
+
+  // Playlist: auto-saved session + export/import to .m3u files.
+  loadSession: () => ipcRenderer.invoke('playlist-load-session'),
+  saveSession: (paths, currentIndex) => ipcRenderer.send('playlist-save-session', paths, currentIndex),
+  exportPlaylist: (paths) => ipcRenderer.invoke('playlist-export', paths),
+  importPlaylist: () => ipcRenderer.invoke('playlist-import'),
 
   setCompact: (compact) => ipcRenderer.send('set-compact', compact),
 

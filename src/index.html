@@ -47,6 +47,20 @@
           <span class="count" id="mainCount">0 tracks</span>
         </div>
         <ul class="track-list" id="mainList"></ul>
+        <div class="list-bar" id="listBar">
+          <button class="list-btn" id="saveListBtn" title="Save this playlist to an .m3u file">
+            <svg viewBox="0 0 24 24" width="15" height="15"><path d="M5 4h11l3 3v13H5zM8 4v5h7V4M8 20v-6h8v6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>Save</span>
+          </button>
+          <button class="list-btn" id="loadListBtn" title="Load a playlist from an .m3u file">
+            <svg viewBox="0 0 24 24" width="15" height="15"><path d="M3 6h7l2 2h9v11H3zM7 13l5 4 5-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>Load</span>
+          </button>
+          <button class="list-btn danger" id="clearListBtn" title="Clear the playlist">
+            <svg viewBox="0 0 24 24" width="15" height="15"><path d="M5 7h14M9 7V4h6v3M7 7l1 13h8l1-13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>Clear</span>
+          </button>
+        </div>
       </section>
 
       <section class="panel sub-panel hidden" id="subPanel">
@@ -120,6 +134,15 @@
         <div class="drop-icon">↻</div>
         <div class="drop-label">Clear list &amp; play this</div>
       </div>
+    </div>
+  </div>
+
+  <!-- Reusable modal (save name / load picker) -->
+  <div id="modalOverlay" class="hidden">
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-title" id="modalTitle"></div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-actions" id="modalActions"></div>
     </div>
   </div>
 

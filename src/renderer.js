@@ -19,6 +19,15 @@ const state = {
   zip: null            // { name, path, mainIndex, entries:[{name,internalPath,blobUrl}], index, coverUrl }
 };
 
+// Last-played-position store, loaded once from the main process. The renderer
+// keeps the authoritative in-memory copy (see loadProgress in Init); saves are
+// mirrored here immediately and persisted via IPC. Schema: see db.js.
+let progressDB = { items: {} };
+let pendingSeek = null;   // resume position to apply on the next loadedmetadata
+let lastSaveTs = 0;       // throttle for IPC progress saves during playback
+let sessionReady = false; // gate auto-save until the saved session is restored
+let playIntent = false;   // are we actively trying to play? (gates auto-skip)
+
 // ---------------------------------------------------------------------------
 // DOM helpers
 // ---------------------------------------------------------------------------
@@ -110,9 +119,12 @@ async function addFiles(paths, mode) {
   items.sort((a, b) => naturalCompare(a.name, b.name));
 
   if (mode === 'replace') {
+    forceSaveCurrent(false); // persist the outgoing track before clearing
     exitZip(false);
     revokeThumbs(state.playlist);
     state.playlist = items;
+    state.currentIndex = -1; // old index is meaningless against the new list
+    lastScroll.main = -1;    // new list → allow the first scroll
     renderMainList();
     playIndex(0, false); // select & load, but don't auto-play
   } else {
@@ -128,7 +140,20 @@ async function addFiles(paths, mode) {
 // ---------------------------------------------------------------------------
 const EQ_SVG = '<svg class="eq" viewBox="0 0 24 24" width="14" height="14"><path d="M6 10v4M11 6v12M16 8v8M21 11v2" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>';
 
+// Auto-scroll the active row into view, but only when the active index actually
+// changes — so re-renders from play/pause don't yank the list while the user is
+// browsing. `block:'nearest'` is a no-op when the row is already visible.
+const lastScroll = { main: -1, sub: -1 };
+function scrollActiveIntoView(listEl, index, key) {
+  if (index < 0) { lastScroll[key] = -1; return; }
+  if (index === lastScroll[key]) return;
+  lastScroll[key] = index;
+  const li = listEl.querySelector('.track.active');
+  if (li) li.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+
 function renderMainList() {
+  if (sessionReady) persistSession(); // any structural/selection change auto-saves
   el.mainCount.textContent = `${state.playlist.length} track${state.playlist.length === 1 ? '' : 's'}`;
   el.mainList.innerHTML = '';
 
@@ -151,7 +176,9 @@ function renderMainList() {
       `<span class="art">${artInner(item, i, playing)}</span>` +
       `<span class="name">${escapeHtml(item.name)}</span>` +
       (item.kind === 'zip' ? '<span class="badge">ZIP</span>' : '') +
-      '<span class="remove" title="Remove">✕</span>';
+      '<span class="track-time"></span>' +
+      '<span class="remove" title="Remove">✕</span>' +
+      '<span class="track-progress"><span class="track-progress-fill"></span></span>';
 
     li.addEventListener('click', (e) => {
       if (e.target.classList.contains('remove')) { removeItem(i); return; }
@@ -160,8 +187,10 @@ function renderMainList() {
 
     attachReorderHandlers(li);
     el.mainList.appendChild(li);
-    scheduleThumb(item);
+    applyUnderline(item);  // paint from cache if we already know this item
+    gateItemWork(item);    // flag dark-red if gone; else thumb + fingerprint
   });
+  scrollActiveIntoView(el.mainList, state.currentIndex, 'main');
 }
 
 // Inner HTML for a main-list item's left thumbnail box: artwork if we have it,
@@ -241,6 +270,465 @@ function revokeThumbs(items) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Content fingerprints + listened-time progress
+//   - Fingerprints identify a file by content (not path) without reading all of
+//     it; computed lazily/throttled like thumbnails and cached on the item.
+//   - The underline under each entry shows listened/total; for a zip it is the
+//     aggregate over its chapters (durations of unplayed chapters estimated from
+//     their uncompressed size).
+// ---------------------------------------------------------------------------
+const clamp01 = (x) => Math.max(0, Math.min(1, x));
+
+// Build the natural-sorted audio-entry list of a zip (index-aligned with the
+// `e` map and with openZip's playback order). Cached on the item.
+async function loadZipEntries(item) {
+  if (item.zipEntries) return item.zipEntries;
+  const list = await window.api.listZip(item.path);
+  const entries = list
+    .filter((e) => isAudio(e.internalPath))
+    .map((e) => ({ internalPath: e.internalPath, name: baseName(e.internalPath), uncompressedSize: e.uncompressedSize }));
+  entries.sort((a, b) => naturalCompare(a.name, b.name));
+  item.zipEntries = entries;
+  return entries;
+}
+
+// Compute (once) and cache the content fingerprint of an item. De-duped so the
+// lazy queue and an on-demand save don't both hit IPC.
+function ensureFingerprint(item) {
+  if (item.fingerprint) return Promise.resolve(item.fingerprint);
+  if (item._fpPromise) return item._fpPromise;
+  item._fpPromise = (async () => {
+    if (item.kind === 'zip') {
+      await loadZipEntries(item);
+      item.fingerprint = await window.api.fingerprintZip(item.path);
+    } else {
+      item.fingerprint = await window.api.fingerprintFile(item.path);
+    }
+    return item.fingerprint;
+  })();
+  return item._fpPromise;
+}
+
+const FP_CONCURRENCY = 3;
+let fpActive = 0;
+const fpQueue = [];
+
+function scheduleFingerprint(item) {
+  if (item.fpTried || item.fingerprint) return;
+  item.fpTried = true;
+  fpQueue.push(item);
+  pumpFingerprints();
+}
+
+function pumpFingerprints() {
+  while (fpActive < FP_CONCURRENCY && fpQueue.length) {
+    const item = fpQueue.shift();
+    fpActive++;
+    ensureFingerprint(item)
+      .then(() => applyUnderline(item))
+      .catch(() => {})
+      .finally(() => { fpActive--; pumpFingerprints(); });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Lazy running-time probing — fill in each entry's total time in the background
+// without playing it, and persist it (content-keyed) so it's instant next launch.
+// Low concurrency + best-effort so it never competes with playback.
+// ---------------------------------------------------------------------------
+const DUR_CONCURRENCY = 2;
+let durActive = 0;
+const durQueue = [];
+
+function scheduleDurations(item) {
+  if (item.durTried) return;
+  item.durTried = true;
+  durQueue.push(item);
+  pumpDurations();
+}
+
+function pumpDurations() {
+  while (durActive < DUR_CONCURRENCY && durQueue.length) {
+    const item = durQueue.shift();
+    durActive++;
+    probeDuration(item).catch(() => {}).finally(() => { durActive--; pumpDurations(); });
+  }
+}
+
+async function probeDuration(item) {
+  const fp = await ensureFingerprint(item).catch(() => null);
+  if (!fp) return;
+  const rec = progressDB.items[fp] || null;
+
+  if (item.kind === 'zip') {
+    if (!item.zipEntries || !item.zipEntries.length) return;
+    // Already have a measured chapter (played or probed) → estimates work; done.
+    if (zipBytesPerSec(item, rec) > 0) { applyUnderline(item); return; }
+    const first = item.zipEntries[0];
+    const dur = await window.api.zipFirstDuration(item.path, first.internalPath);
+    if (!dur) return;
+    const curE = (progressDB.items[fp] || {}).e || {};
+    const pos0 = curE['0'] ? curE['0'][0] : 0; // preserve any played position
+    recordDuration(item, { e: { 0: [pos0, Math.round(dur)] } });
+  } else {
+    if (rec && rec.d > 0) return; // already known
+    const dur = await window.api.getDuration(item.path);
+    if (!dur) return;
+    recordDuration(item, { d: Math.round(dur) });
+  }
+}
+
+// Persist a duration-only record and refresh that item's labels/bars.
+function recordDuration(item, rec) {
+  const fp = item.fingerprint;
+  if (!fp) return;
+  localMergeProgress(fp, rec);
+  applyUnderline(item);
+  if (state.zip && state.playlist[state.zip.mainIndex] === item) refreshSubUnderlines();
+  window.api.saveProgress(fp, rec);
+}
+
+// bytes→seconds rate from the zip's already-measured chapters (0 if none yet).
+function zipBytesPerSec(item, rec) {
+  if (!item.zipEntries || !rec || !rec.e) return 0;
+  let dur = 0, bytes = 0;
+  item.zipEntries.forEach((e, k) => {
+    const t = rec.e[k];
+    if (t && typeof t[1] === 'number' && t[1] > 0 && e.uncompressedSize > 0) {
+      dur += t[1]; bytes += e.uncompressedSize;
+    }
+  });
+  return bytes > 0 ? dur / bytes : 0;
+}
+
+// Aggregate listened/total for a zip, estimating unknown durations by size.
+function zipAggregateFraction(item, rec) {
+  const entries = item.zipEntries;
+  if (!entries || !entries.length || !rec || !rec.e) return 0;
+  const bps = zipBytesPerSec(item, rec);
+  let total = 0, listened = 0;
+  entries.forEach((e, k) => {
+    const t = rec.e[k];
+    const measured = t && typeof t[1] === 'number' && t[1] > 0 ? t[1] : null;
+    const est = measured != null ? measured : (bps > 0 && e.uncompressedSize > 0 ? e.uncompressedSize * bps : null);
+    if (est == null) return;
+    total += est;
+    listened += Math.min(t ? t[0] : 0, est);
+  });
+  return total > 0 ? clamp01(listened / total) : 0;
+}
+
+// Fraction for a single zip chapter (measured duration, else size-estimated).
+function subChapterFraction(rec, item, idx) {
+  if (!rec || !rec.e) return 0;
+  const t = rec.e[idx];
+  if (!t) return 0;
+  let dur = (typeof t[1] === 'number' && t[1] > 0) ? t[1] : null;
+  if (dur == null) {
+    const bps = zipBytesPerSec(item, rec);
+    const size = item.zipEntries && item.zipEntries[idx] && item.zipEntries[idx].uncompressedSize;
+    if (bps > 0 && size > 0) dur = size * bps;
+  }
+  if (!dur) return t[0] > 0 ? 0.02 : 0;
+  return clamp01(t[0] / dur);
+}
+
+// 0..1 listened fraction for a main-list item (null/0 = unread).
+function progressFraction(item) {
+  const fp = item.fingerprint;
+  if (!fp) return 0;
+  const rec = progressDB.items[fp];
+  if (!rec) return 0;
+  if (item.kind === 'zip') return zipAggregateFraction(item, rec);
+  if (!rec.d) return rec.p > 0 ? 0.02 : 0; // duration unknown → thin sliver
+  return clamp01(rec.p / rec.d);
+}
+
+// ---------------------------------------------------------------------------
+// Played / total time labels (shown on the right of each entry).
+// Total is "exact" when a real duration has been measured; otherwise it's a
+// size-based estimate, shown with a leading "~".
+// ---------------------------------------------------------------------------
+function fmtClock(sec) {
+  if (!isFinite(sec) || sec < 0) sec = 0;
+  sec = Math.floor(sec);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const ss = String(sec % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
+}
+
+function fmtTimes(t) {
+  if (!t || !(t.total > 0)) return '';
+  return `${fmtClock(t.played)} / ${t.est ? '~' : ''}${fmtClock(t.total)}`;
+}
+
+// Audio file: known only once it's been played (measured duration in the DB).
+function audioTimes(item) {
+  const rec = item.fingerprint && progressDB.items[item.fingerprint];
+  if (!rec || !(rec.d > 0)) return null;
+  return { played: Math.min(rec.p || 0, rec.d), total: rec.d, est: false };
+}
+
+// Zip aggregate: sum of chapter durations; estimated (~) if any chapter's
+// duration is still size-derived rather than measured.
+function zipTimes(item) {
+  const entries = item.zipEntries;
+  if (!entries || !entries.length) return null;
+  const rec = item.fingerprint && progressDB.items[item.fingerprint];
+  const bps = zipBytesPerSec(item, rec);
+  let total = 0, played = 0, est = false;
+  entries.forEach((e, k) => {
+    const t = rec && rec.e && rec.e[k];
+    const measured = t && typeof t[1] === 'number' && t[1] > 0 ? t[1] : null;
+    let dur;
+    if (measured != null) dur = measured;
+    else { est = true; dur = (bps > 0 && e.uncompressedSize > 0) ? e.uncompressedSize * bps : 0; }
+    total += dur;
+    if (t) played += Math.min(t[0], dur > 0 ? dur : t[0]);
+  });
+  return total > 0 ? { played, total, est } : null;
+}
+
+// Single zip chapter: measured duration, else size estimate (~).
+function chapterTimes(item, rec, bps, k) {
+  const e = item.zipEntries && item.zipEntries[k];
+  if (!e) return null;
+  const t = rec && rec.e && rec.e[k];
+  const measured = t && typeof t[1] === 'number' && t[1] > 0 ? t[1] : null;
+  let total, est;
+  if (measured != null) { total = measured; est = false; }
+  else { total = (bps > 0 && e.uncompressedSize > 0) ? e.uncompressedSize * bps : 0; est = true; }
+  return total > 0 ? { played: t ? t[0] : 0, total, est } : null;
+}
+
+// Paint a track node's underline: unread (gray groove) / in-read / complete.
+function setBar(node, frac) {
+  const fill = node.querySelector('.track-progress-fill');
+  if (!fill) return;
+  node.classList.remove('unread', 'complete');
+  if (frac == null || frac < 0.005) {
+    node.classList.add('unread');
+    fill.style.width = '0%';
+  } else if (frac >= 0.99) {
+    node.classList.add('complete');
+    fill.style.width = '100%';
+  } else {
+    fill.style.width = (frac * 100).toFixed(1) + '%';
+  }
+}
+
+function applyUnderline(item) {
+  const i = state.playlist.indexOf(item);
+  if (i < 0) return;
+  const li = el.mainList.querySelector(`.track[data-index="${i}"]`);
+  if (!li) return;
+  const container = li.querySelector('.track-progress');
+  if (!container) return;
+  // A zip shows one segment per chapter, each with its own progress; a plain
+  // audio file (or a zip not yet listed) shows the single aggregate bar.
+  if (item.kind === 'zip' && item.zipEntries && item.zipEntries.length) {
+    renderSegments(container, item);
+  } else {
+    setBar(li, progressFraction(item));
+  }
+  const timeEl = li.querySelector('.track-time');
+  if (timeEl) timeEl.textContent = fmtTimes(item.kind === 'zip' ? zipTimes(item) : audioTimes(item));
+}
+
+// Paint a zip row's multi-segment bar (one segment per chapter). Segment DOM is
+// built once per chapter-count; later calls only update fills (cheap on every
+// timeupdate).
+function renderSegments(container, item) {
+  const n = item.zipEntries.length;
+  if (container.dataset.segs !== String(n)) {
+    container.classList.add('segmented');
+    container.innerHTML = Array.from({ length: n },
+      () => '<span class="seg"><span class="seg-fill"></span></span>').join('');
+    container.dataset.segs = String(n);
+  }
+  const rec = progressDB.items[item.fingerprint] || null;
+  const bps = zipBytesPerSec(item, rec);
+  const segs = container.children;
+  for (let k = 0; k < n; k++) {
+    const seg = segs[k];
+    // Width ∝ chapter length: measured duration when known, else size-estimate.
+    const w = String(Math.max(0.001, chapterWeight(item, rec, bps, k)));
+    if (seg.style.flexGrow !== w) seg.style.flexGrow = w;
+    setSeg(seg, subChapterFraction(rec, item, k));
+  }
+}
+
+// Relative size of one chapter for segment widths (same unit basis as the
+// aggregate: measured seconds, or size→seconds estimate, or raw bytes).
+function chapterWeight(item, rec, bps, k) {
+  const t = rec && rec.e && rec.e[k];
+  const measured = t && typeof t[1] === 'number' && t[1] > 0 ? t[1] : null;
+  if (measured != null) return measured;
+  const size = item.zipEntries[k].uncompressedSize || 0;
+  if (size > 0) return bps > 0 ? size * bps : size;
+  return 1; // 0-byte entry still gets a sliver
+}
+
+function setSeg(seg, frac) {
+  const fill = seg.querySelector('.seg-fill');
+  if (!fill) return;
+  seg.classList.remove('unread', 'complete');
+  if (frac == null || frac < 0.005) { seg.classList.add('unread'); fill.style.width = '0%'; }
+  else if (frac >= 0.99) { seg.classList.add('complete'); fill.style.width = '100%'; }
+  else fill.style.width = (frac * 100).toFixed(1) + '%';
+}
+
+function refreshAllUnderlines() {
+  state.playlist.forEach(applyUnderline);
+}
+
+// ---------------------------------------------------------------------------
+// Missing-file detection — flag entries whose file no longer exists.
+// ---------------------------------------------------------------------------
+async function checkExists(item) {
+  if (!item.existChecked) {
+    let ok = true;
+    try { ok = await window.api.pathExists(item.path); } catch (_) { ok = true; }
+    item.existChecked = true;
+    item.missing = !ok;
+  }
+  applyMissing(item);
+  return !item.missing;
+}
+
+// Existence-gate the heavier per-item work so a missing file isn't probed
+// (avoids futile zip-list / fingerprint / artwork reads on dead entries).
+async function gateItemWork(item) {
+  if (!(await checkExists(item))) return;
+  scheduleThumb(item);
+  scheduleFingerprint(item);
+  scheduleDurations(item);
+}
+
+function applyMissing(item) {
+  const i = state.playlist.indexOf(item);
+  if (i < 0) return;
+  const li = el.mainList.querySelector(`.track[data-index="${i}"]`);
+  if (!li) return;
+  li.classList.toggle('missing', !!item.missing);
+  if (item.missing) li.title = 'File not found:\n' + item.path;
+  else li.removeAttribute('title');
+}
+
+function applySubUnderline(li, idx) {
+  if (!state.zip) return;
+  const item = state.playlist[state.zip.mainIndex];
+  const fp = item && item.fingerprint;
+  const rec = (fp && progressDB.items[fp]) || null;
+  setBar(li, subChapterFraction(rec, item, idx));
+  const timeEl = li.querySelector('.track-time');
+  if (timeEl && item) {
+    timeEl.textContent = fmtTimes(chapterTimes(item, rec, zipBytesPerSec(item, rec), idx));
+  }
+}
+
+function refreshSubUnderlines() {
+  if (!state.zip) return;
+  el.subList.querySelectorAll('.track').forEach((li, idx) => applySubUnderline(li, idx));
+}
+
+// ---------------------------------------------------------------------------
+// Saving / restoring listened time
+// ---------------------------------------------------------------------------
+// Snapshot the current playback position as a (compact) record, or null if
+// there's nothing worth saving (no metadata / barely started).
+function captureSnapshot(complete) {
+  const cur = audio.currentTime || 0;
+  if (!complete && cur < 1) return null; // avoid clobbering a saved spot at load
+  const dur = (isFinite(audio.duration) && audio.duration > 0) ? Math.round(audio.duration) : null;
+  let pos = Math.round(cur);
+  if (complete && dur) pos = dur;
+
+  if (state.zip && state.zip.index >= 0) {
+    const item = state.playlist[state.zip.mainIndex];
+    if (!item) return null;
+    const idx = state.zip.index;
+    const rec = { i: idx, e: { [idx]: [pos, dur] } };
+    if (complete) rec._complete = true;
+    return { item, rec };
+  }
+  if (state.currentIndex >= 0) {
+    const item = state.playlist[state.currentIndex];
+    if (!item || item.kind === 'zip') return null; // zip selected but not opened
+    const rec = { p: pos, d: dur };
+    if (complete) rec._complete = true;
+    return { item, rec };
+  }
+  return null;
+}
+
+// Merge a record into the in-memory DB (mirrors db.put's merge), minus the
+// _complete signal which is only meaningful to the persistence gate.
+function localMergeProgress(fp, rec) {
+  const cur = progressDB.items[fp] || {};
+  const next = Object.assign({}, cur, rec);
+  if (rec.e) next.e = Object.assign({}, cur.e, rec.e);
+  delete next._complete;
+  next.u = Math.floor(Date.now() / 1000);
+  progressDB.items[fp] = next;
+}
+
+function persistProgress(snap, alsoIPC) {
+  const fp = snap.item.fingerprint;
+  if (!fp) return false;
+  localMergeProgress(fp, snap.rec);
+  applyUnderline(snap.item);
+  if (state.zip) refreshSubUnderlines();
+  if (alsoIPC) window.api.saveProgress(fp, snap.rec);
+  return true;
+}
+
+// Force-save the current position (pause / track change / completion / unload).
+// Computes the fingerprint inline if it isn't ready so a finished chapter isn't
+// lost.
+async function forceSaveCurrent(complete) {
+  const snap = captureSnapshot(!!complete);
+  if (!snap) return;
+  if (!snap.item.fingerprint) {
+    try { await ensureFingerprint(snap.item); } catch (_) { return; }
+  }
+  persistProgress(snap, true);
+}
+
+// Auto-resume helpers — seek to the saved position once metadata is available,
+// without yanking playback the user has already moved past.
+function applyPendingSeek() {
+  if (pendingSeek == null || !isFinite(audio.duration)) return;
+  if (pendingSeek > 0 && pendingSeek < audio.duration - 2) audio.currentTime = pendingSeek;
+  pendingSeek = null;
+}
+
+async function primeAudioResume(item) {
+  const fp = await ensureFingerprint(item).catch(() => null);
+  if (!fp) return;
+  if (state.zip || state.currentIndex < 0 || state.playlist[state.currentIndex] !== item) return;
+  const rec = progressDB.items[fp];
+  if (!rec || !rec.d || !(rec.p > 0) || rec.p >= rec.d - 2) return;
+  if (audio.currentTime > 1) return; // already progressed
+  if (isFinite(audio.duration) && audio.duration > 0) audio.currentTime = rec.p;
+  else pendingSeek = rec.p;
+}
+
+async function primeSubResume(item, idx, zipPath) {
+  const fp = await ensureFingerprint(item).catch(() => null);
+  if (!fp) return;
+  if (!state.zip || state.zip.path !== zipPath || state.zip.index !== idx) return;
+  const rec = progressDB.items[fp];
+  const t = rec && rec.e && rec.e[idx];
+  if (!t || !(t[0] > 0)) return;
+  if (t[1] && t[0] >= t[1] - 2) return;
+  if (audio.currentTime > 1) return;
+  if (isFinite(audio.duration) && audio.duration > 0) audio.currentTime = t[0];
+  else pendingSeek = t[0];
+}
+
 function renderSubList() {
   if (!state.zip) return;
   el.subZipName.textContent = state.zip.name;
@@ -251,10 +739,14 @@ function renderSubList() {
     const playing = i === state.zip.index && !audio.paused;
     li.innerHTML =
       `<span class="idx">${playing ? EQ_SVG : i + 1}</span>` +
-      `<span class="name">${escapeHtml(entry.name)}</span>`;
+      `<span class="name">${escapeHtml(entry.name)}</span>` +
+      '<span class="track-time"></span>' +
+      '<span class="track-progress"><span class="track-progress-fill"></span></span>';
     li.addEventListener('click', () => playSub(i));
     el.subList.appendChild(li);
+    applySubUnderline(li, i);
   });
+  scrollActiveIntoView(el.subList, state.zip.index, 'sub');
 }
 
 function escapeHtml(s) {
@@ -283,9 +775,12 @@ function removeItem(i) {
 // ---------------------------------------------------------------------------
 function playIndex(i, autoplay = true) {
   if (i < 0 || i >= state.playlist.length) return;
+  forceSaveCurrent(false); // persist the outgoing track's position first
+  pendingSeek = null;
   // Selecting any main item closes an open archive (requirement 5).
   exitZip(false);
   state.currentIndex = i;
+  playIntent = autoplay; // selecting without autoplay must not trigger auto-skip
   const item = state.playlist[i];
 
   if (item.kind === 'zip') {
@@ -294,26 +789,38 @@ function playIndex(i, autoplay = true) {
     else { audio.removeAttribute('src'); audio.load(); }
   } else {
     audio.src = window.api.pathToFileURL(item.path);
+    primeAudioResume(item); // auto-resume from the saved position
     if (autoplay) audio.play().catch(() => {});
   }
   updateNowPlaying();
   renderMainList();
 }
 
-function nextMain() {
-  if (state.currentIndex + 1 < state.playlist.length) {
-    playIndex(state.currentIndex + 1);
-  } else {
-    stopPlayback();
+// First non-missing index scanning from `from` in direction `dir` (+1/-1).
+function firstAvailableFrom(from, dir) {
+  for (let k = from; k >= 0 && k < state.playlist.length; k += dir) {
+    if (!state.playlist[k].missing) return k;
   }
+  return -1;
+}
+
+function nextMain() {
+  const i = firstAvailableFrom(state.currentIndex + 1, 1);
+  if (i >= 0) playIndex(i);
+  else stopPlayback();
 }
 
 function prevMain() {
-  if (state.currentIndex > 0) playIndex(state.currentIndex - 1);
-  else if (state.playlist.length) playIndex(0);
+  if (state.currentIndex > 0) {
+    const i = firstAvailableFrom(state.currentIndex - 1, -1);
+    if (i >= 0) { playIndex(i); return; }
+  }
+  const f = firstAvailableFrom(0, 1);
+  if (f >= 0) playIndex(f);
 }
 
 function stopPlayback() {
+  playIntent = false;
   exitZip(false);
   audio.pause();
   audio.currentTime = 0;
@@ -338,9 +845,9 @@ async function openZip(item, mainIndex) {
 
   const entries = [];
   const images = [];
-  for (const { internalPath } of list) {
+  for (const { internalPath, uncompressedSize } of list) {
     if (isAudio(internalPath)) {
-      entries.push({ name: baseName(internalPath), internalPath, blobUrl: null });
+      entries.push({ name: baseName(internalPath), internalPath, uncompressedSize, blobUrl: null });
     } else if (isImage(internalPath)) {
       images.push(internalPath);
     }
@@ -352,11 +859,22 @@ async function openZip(item, mainIndex) {
     return;
   }
 
+  item.zipEntries = entries; // index-aligned with the saved `e` map
+  lastScroll.sub = -1;       // fresh archive → allow the first scroll
   state.zip = { name: item.name, path: item.path, mainIndex, entries, index: -1, coverUrl: null };
   el.subPanel.classList.remove('hidden');
   renderSubList();
   loadCover(pickCover(images));
-  playSub(0);
+
+  // Auto-resume to the last-played chapter (the file's saved position).
+  let startIndex = 0;
+  try { await ensureFingerprint(item); } catch (_) {}
+  if (!state.zip || state.zip.path !== item.path) return; // switched while hashing
+  applyUnderline(item);
+  refreshSubUnderlines();
+  const rec = item.fingerprint && progressDB.items[item.fingerprint];
+  if (rec && rec.i) startIndex = Math.max(0, Math.min(rec.i, entries.length - 1));
+  playSub(startIndex);
 }
 
 // Prefer common artwork names (cover/folder/front/album/art), otherwise the
@@ -387,9 +905,13 @@ async function loadCover(internalPath) {
 
 async function playSub(i) {
   if (!state.zip || i < 0 || i >= state.zip.entries.length) return;
+  forceSaveCurrent(false); // persist the outgoing chapter's position
+  pendingSeek = null;
+  playIntent = true; // opening/advancing a chapter means we intend to play
   state.zip.index = i;
   const entry = state.zip.entries[i];
   const zipPath = state.zip.path;
+  const zipItem = state.playlist[state.zip.mainIndex];
 
   if (!entry.blobUrl) {
     try {
@@ -408,6 +930,7 @@ async function playSub(i) {
   // The archive may have been closed or switched while we were inflating.
   if (!state.zip || state.zip.path !== zipPath || state.zip.index !== i) return;
   audio.src = entry.blobUrl;
+  if (zipItem) primeSubResume(zipItem, i, zipPath); // auto-resume within chapter
   audio.play().catch(() => {});
   updateNowPlaying();
   renderSubList();
@@ -433,6 +956,8 @@ function prevSub() {
 // advance=true → after closing, continue to the next main track.
 function exitZip(advance) {
   if (!state.zip) return;
+  forceSaveCurrent(false); // persist the chapter position before tearing down
+  lastScroll.sub = -1;
   const fromIndex = state.zip.mainIndex;
   // Release extracted blobs.
   for (const e of state.zip.entries) {
@@ -457,16 +982,27 @@ function exitZip(advance) {
 // ---------------------------------------------------------------------------
 // Unified transport actions
 // ---------------------------------------------------------------------------
+// Start (or resume) playback from `from`, skipping unavailable files.
+function startPlay(from) {
+  const i = firstAvailableFrom(from, 1);
+  if (i >= 0) playIndex(i, true);
+  else stopPlayback();
+}
+
 function togglePlay() {
   if (state.currentIndex < 0) {
-    if (state.playlist.length) playIndex(0, true);
+    if (state.playlist.length) startPlay(0);
     return;
   }
-  // Selected but nothing loaded yet (just dropped, or a zip not yet opened):
-  // start it now.
-  if (!state.zip && !audio.src) { playIndex(state.currentIndex, true); return; }
-  if (audio.paused) audio.play().catch(() => {});
-  else audio.pause();
+  const cur = state.playlist[state.currentIndex];
+  // Nothing loaded yet (just dropped / zip not opened), or the current file is
+  // unavailable → (re)start, skipping over missing entries.
+  if ((!state.zip && !audio.src) || (cur && cur.missing && !state.zip)) {
+    startPlay(state.currentIndex);
+    return;
+  }
+  if (audio.paused) { playIntent = true; audio.play().catch(() => {}); }
+  else { playIntent = false; audio.pause(); }
 }
 
 // Jump within the current track.
@@ -488,6 +1024,7 @@ function prev() {
 }
 
 function onEnded() {
+  forceSaveCurrent(true); // mark the finished track / chapter complete
   if (state.zip) nextSub();
   else nextMain();
 }
@@ -751,13 +1288,177 @@ function pathsFromDrop(e) {
     e.stopPropagation();
     const paths = pathsFromDrop(e);
     hideOverlay();
-    if (paths.length) addFiles(paths, mode);
+    if (!paths.length) return;
+    // "Clear & play" is destructive — confirm before wiping a non-empty list.
+    if (mode === 'replace' && state.playlist.length) confirmReplaceDrop(paths);
+    else addFiles(paths, mode);
   });
 });
+
+// Second confirmation step for a drag-drop that would clear the current list.
+function confirmReplaceDrop(paths) {
+  const n = state.playlist.length;
+  openModal(
+    'Clear current playlist?',
+    `<div class="modal-empty">This removes the current ${n} track${n === 1 ? '' : 's'} and plays the dropped file${paths.length === 1 ? '' : 's'} instead.</div>`,
+    [
+      { label: 'Cancel', onClick: closeModal },
+      { label: 'Clear & play', danger: true, onClick: () => { closeModal(); addFiles(paths, 'replace'); } }
+    ]
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Playlist persistence — auto-saved session + named library
+// ---------------------------------------------------------------------------
+// Push the current list (paths + selection) to the main process; debounced and
+// written atomically there. Called from renderMainList on every change.
+function persistSession() {
+  window.api.saveSession(state.playlist.map((it) => it.path), state.currentIndex);
+}
+
+// Rebuild the in-memory playlist from saved paths and re-select the last track.
+async function restoreSession() {
+  let s = null;
+  try { s = await window.api.loadSession(); } catch (_) {}
+  if (s && Array.isArray(s.paths) && s.paths.length) {
+    state.playlist = s.paths.map(makeItem);
+    renderMainList();
+    const idx = s.currentIndex;
+    if (Number.isInteger(idx) && idx >= 0 && idx < state.playlist.length) {
+      playIndex(idx, false); // select & load (paused); saved position auto-resumes
+    }
+  }
+  sessionReady = true; // from here on, changes auto-save
+}
+
+// Replace the whole list (Load / clear share the teardown).
+function replacePlaylist(paths) {
+  forceSaveCurrent(false);
+  exitZip(false);
+  revokeThumbs(state.playlist);
+  audio.pause();
+  audio.removeAttribute('src');
+  audio.load();
+  state.playlist = (paths || []).map(makeItem);
+  state.currentIndex = -1;
+  lastScroll.main = -1; // new list → allow the first scroll
+  renderMainList();
+  if (state.playlist.length) playIndex(0, false);
+  updateNowPlaying();
+}
+
+// --- Clear (double confirmation) ---
+let clearArmed = false;
+let clearTimer = null;
+
+function disarmClear() {
+  clearArmed = false;
+  if (clearTimer) { clearTimeout(clearTimer); clearTimer = null; }
+  const b = $('clearListBtn');
+  b.classList.remove('armed');
+  b.querySelector('span').textContent = 'Clear';
+}
+
+function onClearClick() {
+  if (!clearArmed) {
+    if (!state.playlist.length) return;
+    clearArmed = true;
+    const b = $('clearListBtn');
+    b.classList.add('armed');
+    b.querySelector('span').textContent = 'Confirm?';
+    clearTimer = setTimeout(disarmClear, 3500);
+    return;
+  }
+  disarmClear();
+  replacePlaylist([]);
+}
+
+// --- Modal (save name / load picker) ---
+function openModal(title, bodyHtml, actions) {
+  $('modalTitle').textContent = title;
+  const body = $('modalBody');
+  body.innerHTML = bodyHtml;
+  const act = $('modalActions');
+  act.innerHTML = '';
+  (actions || []).forEach((a) => {
+    const b = document.createElement('button');
+    b.className = 'modal-btn' + (a.primary ? ' primary' : '') + (a.danger ? ' danger' : '');
+    b.textContent = a.label;
+    b.addEventListener('click', a.onClick);
+    act.appendChild(b);
+  });
+  $('modalOverlay').classList.remove('hidden');
+  return body;
+}
+
+function closeModal() {
+  $('modalOverlay').classList.add('hidden');
+  $('modalBody').innerHTML = '';
+  $('modalActions').innerHTML = '';
+}
+
+// Save → export the current list to an .m3u file (OS save dialog in main).
+async function exportPlaylistFlow() {
+  if (!state.playlist.length) return;
+  try { await window.api.exportPlaylist(state.playlist.map((it) => it.path)); } catch (_) {}
+}
+
+// Load → import an .m3u file (OS open dialog), then ask replace vs. append.
+async function importPlaylistFlow() {
+  let paths = null;
+  try { paths = await window.api.importPlaylist(); } catch (_) {}
+  if (!paths || !paths.length) return;
+  // Expand dirs / drop non-audio + missing entries, preserving the file's order.
+  const expanded = await expandPaths(paths);
+  if (!expanded.length) return;
+  // Only ask replace-vs-append when there's an existing list to lose.
+  if (state.playlist.length) askReplaceOrAppend((mode) => applyImported(expanded, mode));
+  else applyImported(expanded, 'replace');
+}
+
+function askReplaceOrAppend(cb) {
+  openModal(
+    'Import playlist',
+    '<div class="modal-empty">Replace the current playlist, or add these tracks to the end?</div>',
+    [
+      { label: 'Cancel', onClick: closeModal },
+      { label: 'Add to end', onClick: () => { closeModal(); cb('append'); } },
+      { label: 'Replace', primary: true, onClick: () => { closeModal(); cb('replace'); } }
+    ]
+  );
+}
+
+// Apply imported paths in file order (no natural-sort — the saved order wins).
+function applyImported(paths, mode) {
+  if (mode === 'replace') {
+    replacePlaylist(paths);
+  } else {
+    const wasEmpty = state.playlist.length === 0;
+    state.playlist.push(...paths.map(makeItem));
+    renderMainList();
+    if (wasEmpty) playIndex(0, false);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Wiring: buttons, audio events, media keys
 // ---------------------------------------------------------------------------
+$('saveListBtn').addEventListener('click', exportPlaylistFlow);
+$('loadListBtn').addEventListener('click', importPlaylistFlow);
+$('clearListBtn').addEventListener('click', onClearClick);
+
+// Backdrop click / Esc closes the modal.
+$('modalOverlay').addEventListener('mousedown', (e) => {
+  if (e.target === $('modalOverlay')) closeModal();
+});
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('modalOverlay').classList.contains('hidden')) {
+    e.preventDefault();
+    closeModal();
+  }
+}, true);
+
 el.playBtn.addEventListener('click', togglePlay);
 el.prevBtn.addEventListener('click', prev);
 el.nextBtn.addEventListener('click', next);
@@ -788,22 +1489,35 @@ el.seek.addEventListener('input', () => {
   }
 });
 
-audio.addEventListener('play', () => { syncPlayButton(); renderMainList(); renderSubList(); });
-audio.addEventListener('pause', () => { syncPlayButton(); renderMainList(); renderSubList(); });
+audio.addEventListener('play', () => { playIntent = true; syncPlayButton(); renderMainList(); renderSubList(); });
+audio.addEventListener('pause', () => {
+  syncPlayButton(); renderMainList(); renderSubList();
+  if (!audio.ended) forceSaveCurrent(false); // persist on pause (end handled by onEnded)
+});
 audio.addEventListener('ended', onEnded);
 audio.addEventListener('timeupdate', () => {
   el.curTime.textContent = fmtTime(audio.currentTime);
   if (audio.duration) {
     el.seek.value = String(Math.round((audio.currentTime / audio.duration) * 1000));
   }
+  // Update the underline live; persist to disk at most every ~5s.
+  const snap = captureSnapshot(false);
+  if (snap && snap.item.fingerprint) {
+    const now = Date.now();
+    const ipc = now - lastSaveTs > 5000;
+    persistProgress(snap, ipc);
+    if (ipc) lastSaveTs = now;
+  }
 });
 audio.addEventListener('loadedmetadata', () => {
   el.durTime.textContent = fmtTime(audio.duration);
   applySpeed(); // new media resets the rate; restore the selected speed
+  applyPendingSeek(); // auto-resume once we know the duration
 });
 audio.addEventListener('error', () => {
-  // Skip unplayable tracks automatically.
-  if (state.currentIndex >= 0 || state.zip) setTimeout(next, 250);
+  // Auto-skip a track that fails to load — but only while actively playing, so a
+  // merely-selected (e.g. session-restored) unavailable file doesn't auto-advance.
+  if (playIntent && (state.currentIndex >= 0 || state.zip)) setTimeout(next, 250);
 });
 
 // Keyboard shortcuts (within the window) in addition to OS media keys.
@@ -815,6 +1529,7 @@ audio.addEventListener('error', () => {
 //   Cmd+← / Cmd+→    previous / next track
 const VOL_STEP = 0.05;
 window.addEventListener('keydown', (e) => {
+  if (!$('modalOverlay').classList.contains('hidden')) return; // modal owns the keyboard
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
   switch (e.code) {
     case 'Space': e.preventDefault(); togglePlay(); break;
@@ -857,8 +1572,18 @@ window.api.onMediaKey((key) => {
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
+// Persist position + playlist when the window is closing (main flushes on quit).
+window.addEventListener('beforeunload', () => { forceSaveCurrent(false); persistSession(); });
+
 setVolume(0.8);
 applySpeed();
-renderMainList();
+renderMainList(); // initial empty paint (sessionReady is still false → no save)
 updateNowPlaying();
 syncPlayButton();
+
+// Load the listened-time DB first, then restore the saved session so per-file
+// resume positions are available when the last track is re-selected.
+window.api.loadProgress()
+  .then((dbData) => { if (dbData && dbData.items) progressDB = dbData; })
+  .catch(() => {})
+  .finally(() => { refreshAllUnderlines(); restoreSession(); });
